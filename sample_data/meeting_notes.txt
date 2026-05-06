@@ -1,0 +1,33 @@
+# FairTeam AI Sample Meeting Notes
+
+2026-05-01 Kickoff
+참석: A, B, C, D
+A: GitHub repository와 기본 Streamlit 구조를 만들기로 함. 담당자: A, deadline 05-03.
+B: 보고서 목차와 평가 지표 정리를 맡음. 담당자: B, deadline 05-04.
+C: 기존 팀플 평가 사례 자료조사를 맡음. 담당자: C, deadline 05-04.
+D: 테스트 시나리오와 데모 데이터 생성을 맡음. 담당자: D, deadline 05-05.
+결정: 개발 프로젝트형이므로 코드 35% 이상, 문서/발표도 함께 평가한다.
+
+2026-05-04 Progress Check
+참석: A, B, D. C는 연락이 늦고 답장이 없음.
+A: 데이터 로더와 스코어링 함수 1차 구현 완료(done). PR merged.
+B: 보고서 초안과 관련 연구 정리 완료. comments resolved.
+D: 테스트 케이스와 샘플 로그 생성 진행 중.
+TODO 담당자: C 자료조사 문서 업로드 미완료. 팀원들이 불만을 표시함.
+갈등: A가 "마감 직전 혼자 코드 부담이 크다"고 언급.
+
+2026-05-06 Integration Meeting
+참석: A, B, C, D
+A: scoring.py 버그 수정 완료, GitHub actions 추가.
+B: 교수자용 리포트 문장 수정 완료.
+C: 초반 자료조사 링크 2개를 공유했으나 보고서 반영량은 적음. 본인은 오프라인 기여가 많다고 주장.
+D: 테스트와 데모 UI polish 완료. 리뷰 3건 완료.
+결정: 자기평가와 실제 로그를 비교하는 섹션을 추가한다.
+
+2026-05-08 Final Check
+참석: A, B, D. C는 지각.
+A: backend integration finished.
+B: final report submitted.
+D: demo script completed.
+TODO: C가 맡은 남은 자료조사 요약은 B가 대체 작성함.
+갈등 위험: 역할 분담표 대비 C의 완료 기록 부족. 단, 초기 자료조사 흔적은 있으므로 완전 무임승차로 단정하지 않음.
