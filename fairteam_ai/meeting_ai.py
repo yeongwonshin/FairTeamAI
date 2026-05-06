@@ -3,10 +3,11 @@ from __future__ import annotations
 """Meeting-note evidence structuring.
 
 This module gives the project an AI-ready analysis layer without making the demo
-fragile. If OPENAI_API_KEY is available and the optional openai package is
-installed, `extract_meeting_insights(..., use_llm=True)` can ask an LLM to return
-structured JSON. Otherwise it falls back to a deterministic Korean/English rule
-extractor that produces the same schema, so Streamlit and CLI demos always run.
+fragile. If an OpenAI API key is provided explicitly, or OPENAI_API_KEY is
+available in the environment, and the optional openai package is installed,
+`extract_meeting_insights(..., use_llm=True)` can ask an LLM to return structured
+JSON. Otherwise it falls back to a deterministic Korean/English rule extractor
+that produces the same schema, so Streamlit and CLI demos always run.
 """
 
 import json
@@ -27,7 +28,19 @@ class MeetingInsight:
     confidence: float
     source_sentence: str
     suggested_review_action: str
+    analysis_engine: str = "rule_fallback"
 
+
+INSIGHT_COLUMNS = [
+    "member",
+    "evidence_type",
+    "polarity",
+    "severity",
+    "confidence",
+    "source_sentence",
+    "suggested_review_action",
+    "analysis_engine",
+]
 
 NEGATIVE_PATTERNS = {
     "missed_deadline": ["미완료", "누락", "deadline", "마감", "not done", "missing", "failed"],
@@ -73,7 +86,16 @@ def _mentioned_members(line: str, members: Sequence[str]) -> List[str]:
     return found
 
 
-def _mk(member: str, evidence_type: str, polarity: str, severity: float, confidence: float, line: str) -> MeetingInsight:
+def _mk(
+    member: str,
+    evidence_type: str,
+    polarity: str,
+    severity: float,
+    confidence: float,
+    line: str,
+    *,
+    engine: str = "rule_fallback",
+) -> MeetingInsight:
     action = {
         "positive": "해당 긍정 기여가 실제 산출물 로그와 연결되는지 확인",
         "negative": "해당 위험 신호가 일시적 상황인지 반복 패턴인지 원자료 재검토",
@@ -87,6 +109,7 @@ def _mk(member: str, evidence_type: str, polarity: str, severity: float, confide
         confidence=float(max(0.0, min(1.0, confidence))),
         source_sentence=line,
         suggested_review_action=action,
+        analysis_engine=engine,
     )
 
 
@@ -135,9 +158,20 @@ def _rule_based_extract(meeting_notes: str, members: Sequence[str]) -> List[Meet
     return list(unique.values())
 
 
-def _try_openai_extract(meeting_notes: str, members: Sequence[str]) -> List[MeetingInsight] | None:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
+def _coerce_openai_records(payload: object) -> list[dict]:
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        for key in ["insights", "items", "records", "data"]:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [x for x in value if isinstance(x, dict)]
+    return []
+
+
+def _try_openai_extract(meeting_notes: str, members: Sequence[str], *, api_key: str | None = None) -> List[MeetingInsight] | None:
+    resolved_key = (api_key or os.getenv("OPENAI_API_KEY") or "").strip()
+    if not resolved_key:
         return None
     try:
         from openai import OpenAI  # type: ignore
@@ -156,13 +190,14 @@ def _try_openai_extract(meeting_notes: str, members: Sequence[str]) -> List[Meet
     }
     prompt = (
         "You are an audit assistant for university team projects. Extract auditable contribution and fairness signals "
-        "from meeting notes. Do not decide grades. Return only JSON array.\n"
+        "from meeting notes. Do not decide grades. Return only a JSON object with an 'insights' array. "
+        "Every member value must exactly match one of the provided members.\n"
         f"Members: {list(members)}\n"
-        f"Schema: {json.dumps(schema_hint, ensure_ascii=False)}\n"
+        f"Schema per item: {json.dumps(schema_hint, ensure_ascii=False)}\n"
         f"Meeting notes:\n{meeting_notes}"
     )
     try:
-        client = OpenAI(api_key=api_key)
+        client = OpenAI(api_key=resolved_key)
         response = client.chat.completions.create(
             model=model,
             messages=[{"role": "user", "content": prompt}],
@@ -171,11 +206,12 @@ def _try_openai_extract(meeting_notes: str, members: Sequence[str]) -> List[Meet
         )
         text = response.choices[0].message.content or "{}"
         loaded = json.loads(text)
-        records = loaded.get("insights", loaded if isinstance(loaded, list) else [])
+        records = _coerce_openai_records(loaded)
         insights: List[MeetingInsight] = []
+        member_set = set(members)
         for rec in records:
             member = str(rec.get("member", "")).strip()
-            if member not in members:
+            if member not in member_set:
                 continue
             insights.append(
                 MeetingInsight(
@@ -186,6 +222,7 @@ def _try_openai_extract(meeting_notes: str, members: Sequence[str]) -> List[Meet
                     confidence=float(rec.get("confidence", 0.5)),
                     source_sentence=str(rec.get("source_sentence", ""))[:500],
                     suggested_review_action=str(rec.get("suggested_review_action", "원자료 재검토"))[:300],
+                    analysis_engine="openai",
                 )
             )
         return insights or None
@@ -193,21 +230,29 @@ def _try_openai_extract(meeting_notes: str, members: Sequence[str]) -> List[Meet
         return None
 
 
-def extract_meeting_insights(meeting_notes: str, members: Sequence[str], *, use_llm: bool = False) -> pd.DataFrame:
+def extract_meeting_insights(
+    meeting_notes: str,
+    members: Sequence[str],
+    *,
+    use_llm: bool = False,
+    openai_api_key: str | None = None,
+) -> pd.DataFrame:
     """Return structured meeting evidence as a DataFrame.
 
     Columns are stable for both LLM and fallback modes, allowing the scorer,
     reports, and dashboard to treat the result as a first-class evidence source.
     """
     members = [str(m).strip() for m in members if str(m).strip()]
-    insights = _try_openai_extract(meeting_notes, members) if use_llm else None
+    insights = _try_openai_extract(meeting_notes, members, api_key=openai_api_key) if use_llm else None
     if insights is None:
         insights = _rule_based_extract(meeting_notes, members)
     if not insights:
-        return pd.DataFrame(
-            columns=["member", "evidence_type", "polarity", "severity", "confidence", "source_sentence", "suggested_review_action"]
-        )
-    return pd.DataFrame([asdict(item) for item in insights])
+        return pd.DataFrame(columns=INSIGHT_COLUMNS)
+    df = pd.DataFrame([asdict(item) for item in insights])
+    for col in INSIGHT_COLUMNS:
+        if col not in df.columns:
+            df[col] = "" if col not in {"severity", "confidence"} else 0.0
+    return df[INSIGHT_COLUMNS]
 
 
 def summarize_insights_by_member(insights_df: pd.DataFrame, members: Sequence[str]) -> pd.DataFrame:

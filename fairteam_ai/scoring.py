@@ -85,6 +85,7 @@ def compute_fairness_report(
     custom_weights: Dict[str, float] | None = None,
     thresholds: RiskThresholds | None = None,
     use_llm_meeting_analysis: bool = False,
+    openai_api_key: str | None = None,
     meeting_insights: pd.DataFrame | None = None,
 ) -> FairnessReport:
     """Compute a transparent contribution and fairness report.
@@ -105,7 +106,12 @@ def compute_fairness_report(
 
     meeting_df, rule_conflict_risk, conflict_lines = analyze_meeting_notes(meeting_notes, members)
     if meeting_insights is None:
-        meeting_insights = extract_meeting_insights(meeting_notes, members, use_llm=use_llm_meeting_analysis)
+        meeting_insights = extract_meeting_insights(
+            meeting_notes,
+            members,
+            use_llm=use_llm_meeting_analysis,
+            openai_api_key=openai_api_key,
+        )
     insight_summary = summarize_insights_by_member(meeting_insights, members)
     insight_data = _insight_map(insight_summary)
 
