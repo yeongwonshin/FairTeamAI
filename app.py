@@ -6,6 +6,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from fairteam_ai.appeals import AppealStore
 from fairteam_ai.config import DEFAULT_WEIGHTS
 from fairteam_ai.loaders import (
     REQUIRED_DOC_COLUMNS,
@@ -18,6 +19,7 @@ from fairteam_ai.loaders import (
     read_text,
     safe_read_csv,
 )
+from fairteam_ai.privacy import redact_dataframe, redact_text
 from fairteam_ai.reporting import members_to_rows
 from fairteam_ai.scoring import compute_fairness_report
 
@@ -25,13 +27,16 @@ st.set_page_config(page_title="FairTeam AI", page_icon="⚖️", layout="wide")
 
 ROOT = Path(__file__).resolve().parent
 SAMPLE_DIR = ROOT / "sample_data"
+OUT_DIR = ROOT / "outputs"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 st.title("⚖️ FairTeam AI")
-st.caption("팀 프로젝트 기여도 추적 · 갈등 예방 · 교수자용 공정평가 리포트")
+st.caption("팀 프로젝트 기여도 추적 · 조작 방어 · 갈등 예방 · 교수자용 공정평가 리포트")
 
 with st.sidebar:
     st.header("입력 설정")
     use_sample = st.toggle("샘플 데이터로 데모 실행", value=True)
+    redact_export = st.toggle("개인정보 자동 마스킹", value=True)
     project_type = st.selectbox(
         "프로젝트 유형",
         options=list(DEFAULT_WEIGHTS.keys()),
@@ -98,23 +103,51 @@ report = compute_fairness_report(
 
 rows = pd.DataFrame(members_to_rows(report.members))
 rows_display = rows.copy()
-for col in ["contribution_share", "code_share", "document_share", "slide_share", "meeting_share", "role_share", "self_claim_share", "overclaim_gap"]:
+for col in [
+    "contribution_share",
+    "raw_contribution_share",
+    "quality_adjusted_share",
+    "confidence_score",
+    "quality_score",
+    "anti_gaming_score",
+    "code_share",
+    "document_share",
+    "slide_share",
+    "meeting_share",
+    "role_share",
+    "self_claim_share",
+    "overclaim_gap",
+]:
     if col in rows_display.columns:
         rows_display[col] = rows_display[col].apply(lambda x: "" if pd.isna(x) else f"{x*100:.1f}%")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["대시보드", "근거 로그", "갈등/위험", "교수자 리포트", "원자료"])
+professor_report_md = report.professor_report_md
+team_report_md = report.team_report_md
+if redact_export:
+    professor_report_md = redact_text(professor_report_md)
+    team_report_md = redact_text(team_report_md)
+
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(
+    ["대시보드", "근거 로그", "품질/조작 감사", "갈등/위험", "개입/이의제기", "교수자 리포트", "원자료"]
+)
 
 with tab1:
     st.subheader("핵심 요약")
     st.write(report.summary)
-    m1, m2, m3 = st.columns(3)
+    m1, m2, m3, m4 = st.columns(4)
     m1.metric("기여 불균형 Gini", f"{report.gini:.3f}")
     m2.metric("최대/최소 기여 비율", f"{report.imbalance_ratio:.2f}x")
     m3.metric("갈등 위험", f"{report.conflict_risk_score * 100:.1f}%")
+    m4.metric("평균 산출 신뢰도", f"{rows['confidence_score'].mean() * 100:.1f}%")
 
     chart_df = rows.sort_values("contribution_share", ascending=False)
-    fig = px.bar(chart_df, x="member", y="contribution_share", text="contribution_share", title="팀원별 총 기여도 추정치")
-    fig.update_traces(texttemplate="%{text:.1%}", textposition="outside")
+    fig = px.bar(
+        chart_df,
+        x="member",
+        y=["raw_contribution_share", "quality_adjusted_share"],
+        barmode="group",
+        title="원점수 vs 품질 보정 기여도",
+    )
     fig.update_layout(yaxis_tickformat=".0%", yaxis_title="기여도", xaxis_title="팀원")
     st.plotly_chart(fig, use_container_width=True)
 
@@ -136,29 +169,82 @@ with tab2:
         with st.expander(f"{member.name} · {member.contribution_share * 100:.1f}%"):
             for item in member.evidence:
                 st.write("- " + item)
+            if member.audit_flags:
+                st.warning("조작/품질 검토 신호: " + " / ".join(member.audit_flags))
             if member.risk_tags:
-                st.warning(" / ".join(member.risk_tags))
+                st.error("위험 태그: " + " / ".join(member.risk_tags))
 
 with tab3:
+    st.subheader("품질/조작 감사")
+    audit_df = pd.DataFrame(report.audit_rows)
+    st.dataframe(audit_df, use_container_width=True)
+
+    qfig = px.scatter(
+        rows,
+        x="confidence_score",
+        y="quality_score",
+        size="contribution_share",
+        hover_name="member",
+        title="산출 신뢰도 × 근거 품질 매트릭스",
+    )
+    qfig.update_layout(xaxis_tickformat=".0%", yaxis_tickformat=".0%")
+    st.plotly_chart(qfig, use_container_width=True)
+
+    st.info(
+        "이 탭은 구성원을 처벌하기 위한 자동 판정이 아니라, 커밋 쪼개기·대량 붙여넣기·마감 직전 집중·단일 출처 의존처럼 교수자가 원자료를 다시 볼 지점을 표시합니다."
+    )
+
+with tab4:
     st.subheader("갈등 위험 및 무임승차 위험")
     risk_rows = rows[rows["risk_tags"].astype(str).str.len() > 0]
     if risk_rows.empty:
         st.success("위험 태그가 붙은 팀원이 없습니다.")
     else:
-        st.dataframe(risk_rows[["member", "contribution_share", "self_claim_share", "overclaim_gap", "risk_tags"]], use_container_width=True)
+        st.dataframe(
+            risk_rows[["member", "contribution_share", "self_claim_share", "overclaim_gap", "risk_tags"]],
+            use_container_width=True,
+        )
     st.markdown("### 회의록에서 감지된 갈등 문장")
     if report.conflict_evidence:
         for line in report.conflict_evidence:
-            st.write("- " + line)
+            st.write("- " + (redact_text(line) if redact_export else line))
     else:
         st.write("명시적 갈등 문장이 크게 감지되지 않았습니다.")
 
-with tab4:
+with tab5:
+    st.subheader("개입 권장안")
+    for i, action in enumerate(report.intervention_plan, start=1):
+        st.write(f"{i}. {action}")
+
+    st.markdown("---")
+    st.subheader("팀원 이의제기 접수")
+    appeal_store = AppealStore(OUT_DIR / "appeals.jsonl")
+    with st.form("appeal_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            appeal_member = st.selectbox("팀원", options=members)
+            appeal_category = st.selectbox("분류", options=["코드", "문서", "발표", "회의", "역할", "기타"])
+        with c2:
+            appeal_ref = st.text_input("증거 링크/파일명", placeholder="예: PR #12, 보고서 2장 초안, 회의록 2026-05-01")
+        appeal_claim = st.text_area("이의제기 내용", placeholder="누락된 오프라인 기여나 잘못 해석된 로그를 구체적으로 적으세요.")
+        submitted = st.form_submit_button("이의제기 제출")
+        if submitted:
+            created = appeal_store.submit(appeal_member, appeal_category, appeal_claim, appeal_ref)
+            st.success(f"이의제기가 접수되었습니다: {created.appeal_id}")
+
+    appeals = appeal_store.list()
+    if appeals:
+        st.markdown("### 접수된 이의제기")
+        st.dataframe(pd.DataFrame([a.__dict__ for a in appeals]), use_container_width=True)
+    else:
+        st.caption("아직 접수된 이의제기가 없습니다.")
+
+with tab6:
     st.subheader("교수자용 공정평가 리포트")
-    st.markdown(report.professor_report_md)
+    st.markdown(professor_report_md)
     st.download_button(
         "교수자 리포트 Markdown 다운로드",
-        data=report.professor_report_md.encode("utf-8"),
+        data=professor_report_md.encode("utf-8"),
         file_name="fairteam_professor_report.md",
         mime="text/markdown",
     )
@@ -168,11 +254,19 @@ with tab4:
         file_name="fairteam_member_scores.csv",
         mime="text/csv",
     )
+    st.download_button(
+        "조작/품질 감사 CSV 다운로드",
+        data=pd.DataFrame(report.audit_rows).to_csv(index=False).encode("utf-8"),
+        file_name="fairteam_quality_audit.csv",
+        mime="text/csv",
+    )
 
-with tab5:
+with tab7:
     st.subheader("입력 원자료 미리보기")
     st.markdown("#### 회의록")
-    st.text_area("meeting_notes", str(bundle["meeting_notes"]), height=220)
+    preview_notes = redact_text(bundle["meeting_notes"]) if redact_export else str(bundle["meeting_notes"])
+    st.text_area("meeting_notes", preview_notes, height=220)
     for key in ["github_log", "docs_revision", "slides_revision", "roles", "self_eval"]:
         st.markdown(f"#### {key}")
-        st.dataframe(bundle[key], use_container_width=True)
+        frame = redact_dataframe(bundle[key]) if redact_export else bundle[key]
+        st.dataframe(frame, use_container_width=True)

@@ -26,11 +26,17 @@ def main() -> None:
     )
     report = compute_fairness_report(members=members, project_type="development", **bundle)
     scores = pd.DataFrame(members_to_rows(report.members))
+    audit = pd.DataFrame(report.audit_rows)
     scores.to_csv(OUT_DIR / "fairteam_member_scores.csv", index=False)
+    audit.to_csv(OUT_DIR / "fairteam_quality_audit.csv", index=False)
     (OUT_DIR / "professor_report.md").write_text(report.professor_report_md, encoding="utf-8")
     (OUT_DIR / "team_report.md").write_text(report.team_report_md, encoding="utf-8")
     print(report.summary)
+    print("\nRecommended interventions:")
+    for i, action in enumerate(report.intervention_plan, start=1):
+        print(f"{i}. {action}")
     print(f"Saved: {OUT_DIR / 'fairteam_member_scores.csv'}")
+    print(f"Saved: {OUT_DIR / 'fairteam_quality_audit.csv'}")
     print(f"Saved: {OUT_DIR / 'professor_report.md'}")
 
 

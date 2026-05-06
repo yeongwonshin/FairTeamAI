@@ -7,7 +7,9 @@ import pandas as pd
 
 from .analyzers import analyze_meeting_notes, numeric_sum_by_member
 from .config import DEFAULT_WEIGHTS, RiskThresholds
+from .interventions import build_intervention_plan
 from .models import FairnessReport, TeamMemberEvidence
+from .quality import build_quality_audit, audit_rows_to_dataframe
 from .reporting import build_professor_report, build_team_report, build_summary
 
 
@@ -165,7 +167,23 @@ def compute_fairness_report(
             + weights.get("role", 0.0) * role_norm[m]
         )
     # Normalize once more to remove rounding/weight leakage.
-    share = _normalize(combined)
+    raw_share = _normalize(combined)
+
+    quality_audits = build_quality_audit(
+        members=members,
+        github_log=github_log,
+        docs_revision=docs_revision,
+        slides_revision=slides_revision,
+        roles=roles,
+        self_eval=self_eval,
+    )
+    adjusted_base = {
+        m: raw_share[m] * (0.60 + 0.40 * quality_audits[m].quality_score)
+        for m in members
+    }
+    # contribution_share is the human-review score after quality confidence dampening.
+    # raw_contribution_share is still preserved in the report for transparency.
+    share = _normalize(adjusted_base)
 
     self_claims = {}
     if self_eval is not None and not self_eval.empty and "member" in self_eval.columns:
@@ -186,7 +204,14 @@ def compute_fairness_report(
             role_points=role_norm[m],
             total_points=combined[m],
             contribution_share=share[m],
+            raw_contribution_share=raw_share[m],
+            quality_adjusted_share=share[m],
+            confidence_score=quality_audits[m].confidence_score,
+            quality_score=quality_audits[m].quality_score,
+            anti_gaming_score=quality_audits[m].anti_gaming_score,
             self_claim_share=self_claims.get(m),
+            audit_flags=list(quality_audits[m].flags),
+            source_coverage=dict(quality_audits[m].source_coverage),
             completed_action_items=int(meeting_data.get(m, {}).get("action_items_completed", 0)),
             assigned_action_items=int(meeting_data.get(m, {}).get("action_items_assigned", 0)),
             attendance_count=int(meeting_data.get(m, {}).get("attendance_count", 0)),
@@ -194,16 +219,33 @@ def compute_fairness_report(
         )
         if ev.self_claim_share is not None:
             ev.overclaim_gap = ev.self_claim_share - ev.contribution_share
-        ev.evidence = _build_member_evidence(m, share[m], code_data[m], doc_data[m], slide_data[m], role_data[m], meeting_data.get(m, {}))
+        ev.evidence = _build_member_evidence(
+            m,
+            share[m],
+            code_data[m],
+            doc_data[m],
+            slide_data[m],
+            role_data[m],
+            meeting_data.get(m, {}),
+            raw_share=raw_share[m],
+            quality_score=quality_audits[m].quality_score,
+            confidence_score=quality_audits[m].confidence_score,
+        )
         ev.risk_tags = _build_risk_tags(ev, thresholds)
+        if quality_audits[m].flags:
+            ev.risk_tags.extend([f"검토: {flag}" for flag in quality_audits[m].flags])
         reports.append(ev)
 
     values = [m.contribution_share for m in reports]
     gini = _gini(values)
     imbalance_ratio = max(values) / max(min(values), 1e-6)
     summary = build_summary(reports, gini, imbalance_ratio, conflict_risk)
-    professor_report = build_professor_report(reports, gini, imbalance_ratio, conflict_risk, conflict_lines, project_type, weights)
-    team_report = build_team_report(reports, conflict_risk, conflict_lines)
+    intervention_plan = build_intervention_plan(reports, conflict_risk, imbalance_ratio)
+    audit_rows = audit_rows_to_dataframe(quality_audits).to_dict(orient="records")
+    professor_report = build_professor_report(
+        reports, gini, imbalance_ratio, conflict_risk, conflict_lines, project_type, weights, intervention_plan
+    )
+    team_report = build_team_report(reports, conflict_risk, conflict_lines, intervention_plan)
     return FairnessReport(
         project_type=project_type,
         weights=weights,
@@ -215,11 +257,31 @@ def compute_fairness_report(
         summary=summary,
         professor_report_md=professor_report,
         team_report_md=team_report,
+        audit_rows=audit_rows,
+        intervention_plan=intervention_plan,
     )
 
 
-def _build_member_evidence(member: str, share: float, code: Dict[str, float], doc: Dict[str, float], slide: Dict[str, float], role: Dict[str, float], meeting: Dict[str, float]) -> List[str]:
-    evidence = [f"총 기여도 추정치: {_percent(share)}"]
+def _build_member_evidence(
+    member: str,
+    share: float,
+    code: Dict[str, float],
+    doc: Dict[str, float],
+    slide: Dict[str, float],
+    role: Dict[str, float],
+    meeting: Dict[str, float],
+    *,
+    raw_share: float | None = None,
+    quality_score: float | None = None,
+    confidence_score: float | None = None,
+) -> List[str]:
+    evidence = [f"품질 보정 후 기여도 추정치: {_percent(share)}"]
+    if raw_share is not None and abs(raw_share - share) >= 0.005:
+        evidence.append(f"원점수 기준 기여도: {_percent(raw_share)} / 품질·조작 신호 반영 후: {_percent(share)}")
+    if quality_score is not None or confidence_score is not None:
+        evidence.append(
+            f"근거 품질 점수: {_percent(quality_score or 0.0)}, 산출 신뢰도: {_percent(confidence_score or 0.0)}"
+        )
     if code.get("commits", 0) or code.get("additions", 0) or code.get("prs_merged", 0):
         evidence.append(
             f"코드 로그: 커밋 {int(code.get('commits', 0))}건, PR 병합 {int(code.get('prs_merged', 0))}건, 변경 라인 {int(code.get('additions', 0) + code.get('deletions', 0))}줄"
