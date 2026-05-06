@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 import numpy as np
 import pandas as pd
@@ -8,13 +8,18 @@ import pandas as pd
 from .analyzers import analyze_meeting_notes, numeric_sum_by_member
 from .config import DEFAULT_WEIGHTS, RiskThresholds
 from .interventions import build_intervention_plan
+from .meeting_ai import extract_meeting_insights, summarize_insights_by_member
 from .models import FairnessReport, TeamMemberEvidence
 from .quality import build_quality_audit, audit_rows_to_dataframe
 from .reporting import build_professor_report, build_team_report, build_summary
-
-
-def _safe_sqrt(x: float) -> float:
-    return float(np.sqrt(max(float(x), 0.0)))
+from .scoring_policy import (
+    build_scoring_policy_markdown,
+    score_code_signal,
+    score_document_signal,
+    score_meeting_signal,
+    score_role_signal,
+    score_slide_signal,
+)
 
 
 def _normalize(raw: Dict[str, float]) -> Dict[str, float]:
@@ -39,6 +44,34 @@ def _percent(x: float) -> str:
     return f"{x * 100:.1f}%"
 
 
+def _insight_lines(insights_df: pd.DataFrame, limit: int = 8) -> List[str]:
+    if insights_df is None or insights_df.empty:
+        return []
+    tmp = insights_df.copy()
+    tmp["severity"] = pd.to_numeric(tmp.get("severity", 0), errors="coerce").fillna(0)
+    negative = tmp[tmp["polarity"].astype(str) == "negative"].sort_values("severity", ascending=False)
+    lines = []
+    for _, row in negative.head(limit).iterrows():
+        sent = str(row.get("source_sentence", "")).strip()
+        if sent and sent not in lines:
+            lines.append(sent)
+    return lines
+
+
+def _insight_map(summary_df: pd.DataFrame) -> Dict[str, Dict[str, float]]:
+    if summary_df is None or summary_df.empty:
+        return {}
+    out: Dict[str, Dict[str, float]] = {}
+    for _, row in summary_df.iterrows():
+        out[str(row["member"])] = {
+            "positive_severity": float(row.get("positive_severity", 0.0)),
+            "negative_severity": float(row.get("negative_severity", 0.0)),
+            "neutral_count": float(row.get("neutral_count", 0.0)),
+            "insight_count": float(row.get("insight_count", 0.0)),
+        }
+    return out
+
+
 def compute_fairness_report(
     *,
     members: List[str],
@@ -51,13 +84,15 @@ def compute_fairness_report(
     project_type: str = "development",
     custom_weights: Dict[str, float] | None = None,
     thresholds: RiskThresholds | None = None,
+    use_llm_meeting_analysis: bool = False,
+    meeting_insights: pd.DataFrame | None = None,
 ) -> FairnessReport:
     """Compute a transparent contribution and fairness report.
 
-    The score is intentionally evidence-based and auditable, not a hidden black box.
-    Each category is normalized across the team first, then combined using project
-    weights. This makes the final percentages comparable even when logs have
-    different units such as commits, words, edits, and meeting turns.
+    The score is evidence-based and auditable, not a hidden black box. Each
+    category is normalized across the team, then combined with project weights.
+    Meeting notes are additionally converted into structured review signals via
+    an optional LLM path with deterministic fallback.
     """
     members = sorted(set(str(m).strip() for m in members if str(m).strip()))
     if not members:
@@ -68,7 +103,20 @@ def compute_fairness_report(
     total_w = sum(weights.values()) or 1.0
     weights = {k: v / total_w for k, v in weights.items()}
 
-    meeting_df, conflict_risk, conflict_lines = analyze_meeting_notes(meeting_notes, members)
+    meeting_df, rule_conflict_risk, conflict_lines = analyze_meeting_notes(meeting_notes, members)
+    if meeting_insights is None:
+        meeting_insights = extract_meeting_insights(meeting_notes, members, use_llm=use_llm_meeting_analysis)
+    insight_summary = summarize_insights_by_member(meeting_insights, members)
+    insight_data = _insight_map(insight_summary)
+
+    negative_severity_total = 0.0
+    if meeting_insights is not None and not meeting_insights.empty:
+        tmp = meeting_insights.copy()
+        tmp["severity"] = pd.to_numeric(tmp.get("severity", 0), errors="coerce").fillna(0.0)
+        negative_severity_total = float(tmp.loc[tmp["polarity"] == "negative", "severity"].sum())
+    insight_conflict_risk = min(1.0, negative_severity_total / max(len(members) * 2.0, 1.0))
+    conflict_risk = max(rule_conflict_risk, insight_conflict_risk)
+    conflict_lines = list(dict.fromkeys(conflict_lines + _insight_lines(meeting_insights)))[:12]
 
     code_data = numeric_sum_by_member(
         github_log,
@@ -111,45 +159,11 @@ def compute_fairness_report(
     raw_role = {}
 
     for m in members:
-        c = code_data[m]
-        raw_code[m] = (
-            4.0 * c["commits"]
-            + 0.55 * _safe_sqrt(c["additions"] + c["deletions"])
-            + 1.8 * c["files_changed"]
-            + 4.5 * c["issues_closed"]
-            + 5.0 * c["prs_merged"]
-            + 2.5 * c["reviews"]
-            + 4.0 * c["bugfix_commits"]
-            + 3.2 * c["test_commits"]
-        )
-        d = doc_data[m]
-        raw_doc[m] = (
-            2.0 * d["edits"]
-            + 0.35 * _safe_sqrt(d["words_added"])
-            + 3.0 * d["comments_resolved"]
-            + 7.0 * d["sections_owned"]
-            + 3.5 * d["suggestions_accepted"]
-            + 3.0 * d["references_added"]
-        )
-        s = slide_data[m]
-        raw_slide[m] = (
-            4.0 * s["slides_edited"]
-            + 5.0 * s["visuals_created"]
-            + 0.25 * _safe_sqrt(s["script_words"])
-            + 3.0 * s["presenter_minutes"]
-        )
-        mt = meeting_data.get(m, {})
-        raw_meeting[m] = (
-            8.0 * mt.get("attendance_count", 0.0)
-            + 2.0 * mt.get("speaking_turns", 0.0)
-            + 4.0 * mt.get("action_items_assigned", 0.0)
-            + 6.0 * mt.get("action_items_completed", 0.0)
-            + 3.0 * mt.get("decision_mentions", 0.0)
-        )
-        r = role_data[m]
-        completion_rate = r["completed_tasks"] / max(r["assigned_tasks"], 1.0)
-        late_penalty = 0.6 * r["late_tasks"]
-        raw_role[m] = max(0.0, 12.0 * completion_rate + 3.0 * r["completed_tasks"] + 3.5 * r["critical_tasks"] - late_penalty)
+        raw_code[m] = score_code_signal(code_data[m])
+        raw_doc[m] = score_document_signal(doc_data[m])
+        raw_slide[m] = score_slide_signal(slide_data[m])
+        raw_meeting[m] = score_meeting_signal(meeting_data.get(m, {}), insight_data.get(m, {}))
+        raw_role[m] = score_role_signal(role_data[m])
 
     code_norm = _normalize(raw_code)
     doc_norm = _normalize(raw_doc)
@@ -166,7 +180,6 @@ def compute_fairness_report(
             + weights.get("meeting", 0.0) * meeting_norm[m]
             + weights.get("role", 0.0) * role_norm[m]
         )
-    # Normalize once more to remove rounding/weight leakage.
     raw_share = _normalize(combined)
 
     quality_audits = build_quality_audit(
@@ -176,13 +189,9 @@ def compute_fairness_report(
         slides_revision=slides_revision,
         roles=roles,
         self_eval=self_eval,
+        meeting_insights=meeting_insights,
     )
-    adjusted_base = {
-        m: raw_share[m] * (0.60 + 0.40 * quality_audits[m].quality_score)
-        for m in members
-    }
-    # contribution_share is the human-review score after quality confidence dampening.
-    # raw_contribution_share is still preserved in the report for transparency.
+    adjusted_base = {m: raw_share[m] * (0.60 + 0.40 * quality_audits[m].quality_score) for m in members}
     share = _normalize(adjusted_base)
 
     self_claims = {}
@@ -227,11 +236,12 @@ def compute_fairness_report(
             slide_data[m],
             role_data[m],
             meeting_data.get(m, {}),
+            insight_data=insight_data.get(m, {}),
             raw_share=raw_share[m],
             quality_score=quality_audits[m].quality_score,
             confidence_score=quality_audits[m].confidence_score,
         )
-        ev.risk_tags = _build_risk_tags(ev, thresholds)
+        ev.risk_tags = _build_risk_tags(ev, thresholds, insight_data.get(m, {}))
         if quality_audits[m].flags:
             ev.risk_tags.extend([f"검토: {flag}" for flag in quality_audits[m].flags])
         reports.append(ev)
@@ -242,8 +252,18 @@ def compute_fairness_report(
     summary = build_summary(reports, gini, imbalance_ratio, conflict_risk)
     intervention_plan = build_intervention_plan(reports, conflict_risk, imbalance_ratio)
     audit_rows = audit_rows_to_dataframe(quality_audits).to_dict(orient="records")
+    score_policy_md = build_scoring_policy_markdown()
     professor_report = build_professor_report(
-        reports, gini, imbalance_ratio, conflict_risk, conflict_lines, project_type, weights, intervention_plan
+        reports,
+        gini,
+        imbalance_ratio,
+        conflict_risk,
+        conflict_lines,
+        project_type,
+        weights,
+        intervention_plan,
+        meeting_insights=meeting_insights,
+        score_policy_md=score_policy_md,
     )
     team_report = build_team_report(reports, conflict_risk, conflict_lines, intervention_plan)
     return FairnessReport(
@@ -259,6 +279,8 @@ def compute_fairness_report(
         team_report_md=team_report,
         audit_rows=audit_rows,
         intervention_plan=intervention_plan,
+        meeting_insights=[] if meeting_insights is None else meeting_insights.to_dict(orient="records"),
+        score_policy_md=score_policy_md,
     )
 
 
@@ -271,17 +293,17 @@ def _build_member_evidence(
     role: Dict[str, float],
     meeting: Dict[str, float],
     *,
+    insight_data: Dict[str, float] | None = None,
     raw_share: float | None = None,
     quality_score: float | None = None,
     confidence_score: float | None = None,
 ) -> List[str]:
+    insight_data = insight_data or {}
     evidence = [f"품질 보정 후 기여도 추정치: {_percent(share)}"]
     if raw_share is not None and abs(raw_share - share) >= 0.005:
         evidence.append(f"원점수 기준 기여도: {_percent(raw_share)} / 품질·조작 신호 반영 후: {_percent(share)}")
     if quality_score is not None or confidence_score is not None:
-        evidence.append(
-            f"근거 품질 점수: {_percent(quality_score or 0.0)}, 산출 신뢰도: {_percent(confidence_score or 0.0)}"
-        )
+        evidence.append(f"근거 품질 점수: {_percent(quality_score or 0.0)}, 산출 신뢰도: {_percent(confidence_score or 0.0)}")
     if code.get("commits", 0) or code.get("additions", 0) or code.get("prs_merged", 0):
         evidence.append(
             f"코드 로그: 커밋 {int(code.get('commits', 0))}건, PR 병합 {int(code.get('prs_merged', 0))}건, 변경 라인 {int(code.get('additions', 0) + code.get('deletions', 0))}줄"
@@ -298,6 +320,10 @@ def _build_member_evidence(
         evidence.append(
             f"회의 로그: 발언 {int(meeting.get('speaking_turns', 0))}회, 액션아이템 {int(meeting.get('action_items_completed', 0))}/{int(meeting.get('action_items_assigned', 0))} 완료"
         )
+    if insight_data.get("insight_count", 0):
+        evidence.append(
+            f"회의 AI 구조화 신호: 긍정 severity {insight_data.get('positive_severity', 0.0):.2f}, 부정/검토 severity {insight_data.get('negative_severity', 0.0):.2f}, 총 {int(insight_data.get('insight_count', 0))}건"
+        )
     if role.get("assigned_tasks", 0):
         evidence.append(
             f"역할 이행: 배정 업무 {int(role.get('assigned_tasks', 0))}개 중 {int(role.get('completed_tasks', 0))}개 완료, 지연 {int(role.get('late_tasks', 0))}개"
@@ -307,7 +333,8 @@ def _build_member_evidence(
     return evidence
 
 
-def _build_risk_tags(ev: TeamMemberEvidence, thresholds: RiskThresholds) -> List[str]:
+def _build_risk_tags(ev: TeamMemberEvidence, thresholds: RiskThresholds, insight_data: Dict[str, float] | None = None) -> List[str]:
+    insight_data = insight_data or {}
     tags: List[str] = []
     if ev.contribution_share < thresholds.very_low_contribution_share:
         tags.append("고위험: 기여 로그 매우 부족")
@@ -319,4 +346,6 @@ def _build_risk_tags(ev: TeamMemberEvidence, thresholds: RiskThresholds) -> List
         tags.append("업무 과중 위험")
     if ev.assigned_action_items > 0 and ev.completed_action_items / max(ev.assigned_action_items, 1) < 0.5:
         tags.append("회의 액션아이템 완료율 낮음")
+    if insight_data.get("negative_severity", 0.0) >= 1.2:
+        tags.append("회의록 구조화 분석상 반복 검토 신호")
     return tags

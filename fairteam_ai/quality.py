@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List
 
 import numpy as np
 import pandas as pd
@@ -72,7 +72,8 @@ def _last_minute_ratio(df: pd.DataFrame, member: str, effort_cols: Iterable[str]
 
 
 def _add_flag(audit: MemberQualityAudit, flag: str, severity: float, source: str, evidence: str) -> None:
-    audit.flags.append(flag)
+    if flag not in audit.flags:
+        audit.flags.append(flag)
     audit.quality_score = max(0.0, audit.quality_score - severity)
     audit.anti_gaming_score = max(0.0, audit.anti_gaming_score - severity * 1.25)
     audit.audit_rows.append(
@@ -86,6 +87,36 @@ def _add_flag(audit: MemberQualityAudit, flag: str, severity: float, source: str
     )
 
 
+def _text_values(rows: pd.DataFrame, candidates: Iterable[str]) -> List[str]:
+    values: List[str] = []
+    if rows is None or rows.empty:
+        return values
+    for col in candidates:
+        if col in rows.columns:
+            values.extend(str(x) for x in rows[col].dropna().tolist() if str(x).strip())
+    return values
+
+
+def _ratio_from_optional_column(rows: pd.DataFrame, col: str) -> float | None:
+    if rows is None or rows.empty or col not in rows.columns:
+        return None
+    series = pd.to_numeric(rows[col], errors="coerce").dropna()
+    if series.empty:
+        return None
+    return float(series.mean())
+
+
+def _meeting_negative_severity(meeting_insights: pd.DataFrame | None, member: str) -> float:
+    if meeting_insights is None or meeting_insights.empty:
+        return 0.0
+    tmp = meeting_insights.copy()
+    if "member" not in tmp.columns:
+        return 0.0
+    tmp["member"] = tmp["member"].astype(str).str.strip()
+    tmp["severity"] = pd.to_numeric(tmp.get("severity", 0), errors="coerce").fillna(0.0)
+    return float(tmp.loc[(tmp["member"] == member) & (tmp.get("polarity", "") == "negative"), "severity"].sum())
+
+
 def build_quality_audit(
     *,
     members: List[str],
@@ -94,11 +125,12 @@ def build_quality_audit(
     slides_revision: pd.DataFrame,
     roles: pd.DataFrame,
     self_eval: pd.DataFrame,
+    meeting_insights: pd.DataFrame | None = None,
 ) -> Dict[str, MemberQualityAudit]:
     """Detect weak evidence, gaming-like patterns, and confidence per member.
 
-    This is deliberately rule-based and transparent. It does not accuse a member;
-    it marks records that deserve human review before a professor uses the score.
+    This is deliberately transparent. It never accuses a member; it marks records
+    that deserve human review before a professor uses the score.
     """
     out: Dict[str, MemberQualityAudit] = {}
     source_cols = {
@@ -108,13 +140,7 @@ def build_quality_audit(
         "role": ["assigned_tasks", "completed_tasks", "late_tasks", "critical_tasks"],
         "self_eval": ["self_claim_percent"],
     }
-    frames = {
-        "code": github_log,
-        "document": docs_revision,
-        "slide": slides_revision,
-        "role": roles,
-        "self_eval": self_eval,
-    }
+    frames = {"code": github_log, "document": docs_revision, "slide": slides_revision, "role": roles, "self_eval": self_eval}
 
     for member in members:
         audit = MemberQualityAudit(member=member)
@@ -122,7 +148,12 @@ def build_quality_audit(
         audit.source_coverage = coverage
         covered_count = sum(coverage.values())
 
-        code = _sum_for(github_log, member, source_cols["code"] + ["bugfix_commits", "test_commits"])
+        code_rows = _member_rows(github_log, member)
+        doc_rows = _member_rows(docs_revision, member)
+        slide_rows = _member_rows(slides_revision, member)
+        self_rows = _member_rows(self_eval, member)
+
+        code = _sum_for(github_log, member, source_cols["code"] + ["bugfix_commits", "test_commits", "generated_files"])
         doc = _sum_for(docs_revision, member, source_cols["document"])
         slide = _sum_for(slides_revision, member, source_cols["slide"])
         role = _sum_for(roles, member, source_cols["role"])
@@ -147,6 +178,25 @@ def build_quality_audit(
                 f"additions={code.get('additions', 0.0):.0f}, files_changed={code.get('files_changed', 0.0):.0f}",
             )
 
+        generated_ratio = code.get("generated_files", 0.0) / max(code.get("files_changed", 0.0), 1.0)
+        if code.get("generated_files", 0.0) >= 3 and generated_ratio >= 0.35:
+            _add_flag(audit, "자동 생성/빌드 산출물 기여 과대평가 의심", 0.10, "github_log", f"generated_file_ratio={generated_ratio:.2f}")
+
+        unique_message_ratio = _ratio_from_optional_column(code_rows, "unique_message_ratio")
+        if unique_message_ratio is not None and commits >= 5 and unique_message_ratio <= 0.35:
+            _add_flag(audit, "반복 커밋 메시지 패턴", 0.08, "github_log", f"unique_message_ratio={unique_message_ratio:.2f}")
+
+        dominant_file_ratio = _ratio_from_optional_column(code_rows, "dominant_file_ratio")
+        if dominant_file_ratio is not None and commits >= 5 and dominant_file_ratio >= 0.70:
+            _add_flag(audit, "동일 파일 반복 수정 집중", 0.08, "github_log", f"dominant_file_ratio={dominant_file_ratio:.2f}")
+
+        messages = " | ".join(_text_values(code_rows, ["commit_message", "message", "commit_messages"])).lower()
+        vague_tokens = ["update", "fix", "final", "asdf", "misc", "wip", "수정", "최종"]
+        if commits >= 6 and messages:
+            vague_count = sum(messages.count(tok) for tok in vague_tokens)
+            if vague_count >= max(4, commits * 0.45):
+                _add_flag(audit, "의미가 약한 커밋 메시지 과다", 0.07, "github_log", f"vague_message_hits={vague_count}")
+
         if doc.get("words_added", 0.0) >= 3000 and doc.get("sections_owned", 0.0) <= 1 and doc.get("comments_resolved", 0.0) <= 1:
             _add_flag(
                 audit,
@@ -156,17 +206,25 @@ def build_quality_audit(
                 f"words_added={doc.get('words_added', 0.0):.0f}, sections_owned={doc.get('sections_owned', 0.0):.0f}, comments_resolved={doc.get('comments_resolved', 0.0):.0f}",
             )
 
+        if doc.get("words_added", 0.0) >= 1200 and doc.get("references_added", 0.0) == 0 and doc.get("comments_resolved", 0.0) <= 1:
+            _add_flag(audit, "문서 분량 대비 검증 흔적 부족", 0.08, "docs_revision", f"words_added={doc.get('words_added', 0.0):.0f}, references_added=0")
+
+        if slide.get("presenter_minutes", 0.0) >= 5 and slide.get("slides_edited", 0.0) == 0 and slide.get("script_words", 0.0) == 0:
+            _add_flag(audit, "발표 담당 시간 대비 산출물 로그 부족", 0.08, "slides_revision", f"presenter_minutes={slide.get('presenter_minutes', 0.0):.1f}")
+
         if role.get("assigned_tasks", 0.0) >= 3:
             completion_rate = role.get("completed_tasks", 0.0) / max(role.get("assigned_tasks", 0.0), 1.0)
             late_rate = role.get("late_tasks", 0.0) / max(role.get("assigned_tasks", 0.0), 1.0)
             if completion_rate < 0.5 or late_rate >= 0.5:
-                _add_flag(
-                    audit,
-                    "업무 지연/미완료 비율 높음",
-                    0.14,
-                    "roles",
-                    f"completion_rate={completion_rate:.2f}, late_rate={late_rate:.2f}",
-                )
+                _add_flag(audit, "업무 지연/미완료 비율 높음", 0.14, "roles", f"completion_rate={completion_rate:.2f}, late_rate={late_rate:.2f}")
+
+        self_claim = float(_num(self_rows, "self_claim_percent").mean()) if not self_rows.empty and "self_claim_percent" in self_rows.columns else 0.0
+        if self_claim >= 30.0 and covered_count <= 2:
+            _add_flag(audit, "자기평가 주장 대비 확인 출처 부족", 0.10, "self_eval", f"self_claim_percent={self_claim:.1f}, covered_sources={covered_count}")
+
+        negative_sev = _meeting_negative_severity(meeting_insights, member)
+        if negative_sev >= 1.2:
+            _add_flag(audit, "회의록 구조화 분석상 반복 부정 신호", 0.10, "meeting_insights", f"negative_severity_sum={negative_sev:.2f}")
 
         for src, df, effort_cols in [
             ("github_log", github_log, ["commits", "additions", "deletions", "files_changed"]),
@@ -176,6 +234,9 @@ def build_quality_audit(
             ratio = _last_minute_ratio(df, member, effort_cols)
             if ratio is not None and ratio >= 0.75:
                 _add_flag(audit, "마감 직전 기여 집중", 0.08, src, f"last_20pct_time_effort_ratio={ratio:.2f}")
+
+        if covered_count <= 1:
+            _add_flag(audit, "단일 출처에 과도하게 의존", 0.08, "source_coverage", f"covered_sources={covered_count}")
 
         raw_volume = (
             commits
@@ -189,8 +250,6 @@ def build_quality_audit(
         volume_bonus = min(0.35, np.log1p(raw_volume) / np.log1p(120.0) * 0.35)
         flag_penalty = min(0.35, 0.08 * len(audit.flags))
         audit.confidence_score = float(np.clip(0.12 + coverage_bonus + volume_bonus - flag_penalty, 0.0, 1.0))
-        if covered_count <= 1:
-            _add_flag(audit, "단일 출처에 과도하게 의존", 0.08, "source_coverage", f"covered_sources={covered_count}")
         out[member] = audit
     return out
 

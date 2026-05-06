@@ -45,3 +45,5 @@ class FairnessReport:
     team_report_md: str
     audit_rows: List[Dict[str, Any]] = field(default_factory=list)
     intervention_plan: List[str] = field(default_factory=list)
+    meeting_insights: List[Dict[str, Any]] = field(default_factory=list)
+    score_policy_md: str = ""

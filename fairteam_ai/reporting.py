@@ -37,6 +37,8 @@ def build_professor_report(
     project_type: str,
     weights: Dict[str, float],
     intervention_plan: List[str] | None = None,
+    meeting_insights=None,
+    score_policy_md: str = "",
 ) -> str:
     intervention_plan = intervention_plan or []
     lines: List[str] = []
@@ -51,7 +53,11 @@ def build_professor_report(
     lines.append("- 해석 원칙: 본 점수는 최종 성적이 아니라 Git/문서/회의/역할/자기평가 로그 기반의 검토 보조 지표입니다.")
     lines.append("- 보정 원칙: 원점수는 보존하되, 조작 의심·단일 출처 의존·근거 부족 신호가 있으면 품질 보정 점수를 함께 표시합니다.")
     lines.append("")
-    lines.append("## 3. 팀원별 기여도 추정")
+    if score_policy_md:
+        lines.append("## 3. 산식 및 보정 근거")
+        lines.extend(score_policy_md.replace("## 점수 산식 근거", "").strip().splitlines())
+        lines.append("")
+    lines.append("## 4. 팀원별 기여도 추정")
     lines.append("| 팀원 | 품질보정 기여도 | 원점수 기여도 | 신뢰도 | 근거품질 | 조작방어 | 코드 | 문서 | 발표 | 회의 | 역할 | 위험 태그 |")
     lines.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|")
     for m in sorted(members, key=lambda x: x.contribution_share, reverse=True):
@@ -63,7 +69,7 @@ def build_professor_report(
             f"{pct(m.meeting_points)} | {pct(m.role_points)} | {tags} |"
         )
     lines.append("")
-    lines.append("## 4. 근거 로그")
+    lines.append("## 5. 근거 로그")
     for m in sorted(members, key=lambda x: x.contribution_share, reverse=True):
         lines.append(f"### {m.name}")
         for item in m.evidence:
@@ -79,7 +85,7 @@ def build_professor_report(
         if m.risk_tags:
             lines.append("- 검토 필요: " + "; ".join(m.risk_tags))
         lines.append("")
-    lines.append("## 5. 갈등·무임승차 조기 신호")
+    lines.append("## 6. 갈등·무임승차 조기 신호")
     lines.append(f"- 갈등 위험 점수: {pct(conflict_risk)}")
     if conflict_lines:
         lines.append("- 감지된 문장 예시:")
@@ -88,7 +94,24 @@ def build_professor_report(
     else:
         lines.append("- 회의록에서 명시적 갈등 문장은 크게 감지되지 않았습니다.")
     lines.append("")
-    lines.append("## 6. 권장 조치")
+    if meeting_insights is not None and hasattr(meeting_insights, "empty") and not meeting_insights.empty:
+        lines.append("## 7. 회의록 AI 구조화 신호")
+        lines.append("| 팀원 | 유형 | 방향 | 심각도 | 신뢰도 | 근거 문장 |")
+        lines.append("|---|---|---|---:|---:|---|")
+        tmp = meeting_insights.copy()
+        try:
+            tmp["severity"] = tmp["severity"].astype(float)
+            tmp = tmp.sort_values(["severity", "confidence"], ascending=False).head(12)
+        except Exception:
+            tmp = tmp.head(12)
+        for _, row in tmp.iterrows():
+            src = str(row.get("source_sentence", "")).replace("|", "/")[:140]
+            lines.append(
+                f"| {row.get('member', '')} | {row.get('evidence_type', '')} | {row.get('polarity', '')} | "
+                f"{float(row.get('severity', 0)):.2f} | {float(row.get('confidence', 0)):.2f} | {src} |"
+            )
+        lines.append("")
+    lines.append("## 8. 권장 조치")
     if intervention_plan:
         for item in intervention_plan:
             lines.append(f"- {item}")

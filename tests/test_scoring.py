@@ -18,4 +18,6 @@ def test_sample_scoring_runs():
     report = compute_fairness_report(members=members, project_type="development", **bundle)
     assert len(report.members) == 4
     assert abs(sum(m.contribution_share for m in report.members) - 1.0) < 1e-6
+    assert report.meeting_insights
+    assert report.score_policy_md
     assert any("기여 로그" in ";".join(m.risk_tags) or "자기평가" in ";".join(m.risk_tags) for m in report.members)
