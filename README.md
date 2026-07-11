@@ -1,73 +1,312 @@
 # FairTeam AI
 
-**FairTeam AI**는 팀 프로젝트 진행 중 발생하는 무임승차, 기여도 조작, 역할 불균형, 갈등 위험을 조기에 감지하고, 교수자가 검토할 수 있는 공정평가 근거 리포트를 생성하는 AI 에이전트형 대시보드입니다.
+**FairTeam AI turns scattered teamwork records into a transparent, review-ready picture of contribution, workload balance, collaboration risk, and evidence quality.**
 
-핵심은 팀원이 직접 퍼센티지를 입력하는 방식이 아니라, 다음 원자료를 통합해 **품질 보정 기여도, 조작 의심 신호, 회의록 구조화 증거, 교수자용 리포트**를 자동 생성한다는 점입니다.
+It is designed for instructors, project mentors, bootcamp operators, student teams, and organizations that need a fairer way to review team projects without relying only on self-reported percentages or raw activity counts.
 
-- 회의록 TXT/MD
-- GitHub 커밋/PR/이슈 로그 CSV 또는 GitHub API 수집
-- Google Docs 또는 보고서 수정 기록 CSV
-- 발표자료 수정 기록 CSV
-- 역할분담표 및 업무 완료 기록 CSV
-- 팀원 자기평가 CSV
+FairTeam AI does **not** automatically assign a final grade. It helps a human reviewer understand what happened, identify where evidence is weak, ask better follow-up questions, and document a defensible review process.
 
-## 대상급 보강 포인트
+---
 
-1. **AI 회의록 구조화**  
-   회의록을 팀원별 JSON형 증거로 구조화합니다. OpenAI API 키가 있으면 LLM 분석을 시도하고, 키가 없으면 동일 스키마의 규칙 기반 fallback으로 데모가 깨지지 않게 동작합니다.
+## Why users choose FairTeam AI
 
-2. **GitHub API 수집**  
-   `github_log.csv` 업로드뿐 아니라 `owner/repo` 또는 GitHub URL을 입력해 커밋 로그를 자동 수집할 수 있습니다.
+### See contribution across the whole project
 
-3. **점수 산식 근거 명시**  
-   라인 수와 단어 수는 `sqrt` 압축을 적용해 대량 붙여넣기 과대평가를 줄이고, PR/이슈/리뷰/테스트 커밋은 검증 가능한 협업 품질 신호로 반영합니다.
+FairTeam AI combines multiple evidence sources instead of treating commit count as the entire project:
 
-4. **조작 방어 강화**  
-   커밋 쪼개기, 대량 붙여넣기, 반복 커밋 메시지, 동일 파일 반복 수정, 자동 생성 파일, 문서 검증 흔적 부족, 자기평가 과장, 회의록 부정 신호를 감사합니다.
+- GitHub commits, pull requests, issues, reviews, tests, and bug fixes
+- Document revision history
+- Presentation and script work
+- Meeting attendance, decisions, and action items
+- Assigned and completed responsibilities
+- Self-evaluation and peer comments
 
-5. **교수자 다팀 비교**  
-   여러 팀 폴더를 한 번에 분석해 Gini, 갈등 위험, 고위험 팀원 수, 평균 신뢰도를 비교할 수 있습니다.
+### Reduce activity-count bias
 
-## 설치
+Large copy-and-paste changes, repetitive commits, generated files, last-minute activity, and single-source dependence can make raw activity look more meaningful than it is. FairTeam AI keeps the original activity signal visible while also producing a quality-adjusted contribution view.
+
+### Find problems before the final deadline
+
+The dashboard highlights:
+
+- Low-evidence participation
+- Workload overload
+- Missed or substituted responsibilities
+- Communication and response issues
+- Self-evaluation gaps
+- Evidence that needs manual verification
+
+This allows teams and instructors to intervene while the project can still be corrected.
+
+### Keep every conclusion reviewable
+
+Every score is accompanied by evidence, source coverage, confidence, quality flags, and recommended review actions. The system is designed to point reviewers back to original files rather than hide decisions inside a black box.
+
+### Give team members a formal appeal path
+
+Members can submit missing evidence or challenge an incorrect interpretation. Reviewers can move each appeal through submitted, under-review, accepted, or rejected states and leave a written decision note.
+
+---
+
+## Product highlights
+
+### Evidence-adjusted contribution analysis
+
+FairTeam AI calculates category-level signals for code, documents, slides, meetings, and role completion. Project-type presets and custom weights make the analysis usable for development, report-heavy, presentation-heavy, or balanced projects.
+
+### Review Readiness Score
+
+Before an instructor relies on a report, FairTeam AI checks whether the available evidence is sufficient for human review. The score considers:
+
+- Core source coverage
+- Average analysis confidence
+- Conflict risk
+- Unresolved appeals
+- Quality and anti-gaming flags
+
+The result is shown as:
+
+- `Ready for human review`
+- `Needs more evidence`
+- `Insufficient for decision`
+
+### AI-structured meeting evidence
+
+When an OpenAI API key is configured, meeting notes can be converted into validated structured records with the OpenAI Responses API and schema-constrained outputs.
+
+The AI layer extracts signals such as:
+
+- Completed work
+- Assigned action items
+- Missed deadlines
+- No-response incidents
+- Task substitution and recovery
+- Review activity
+- Workload overload
+- Conflict evidence
+
+If no API key is available, or if the API call fails, FairTeam AI automatically uses a deterministic rule-based engine with the same output schema.
+
+### AI Review Brief
+
+Reviewers can generate a structured brief containing:
+
+- Executive summary
+- Decision-readiness assessment
+- Priority findings
+- Questions to ask the team
+- Recommended next steps
+- Review caveats
+
+The brief never assigns a grade and is designed to support, not replace, human judgment. A deterministic brief is always available; OpenAI enhancement is optional.
+
+### Privacy-first AI workflow
+
+Before meeting notes are sent to OpenAI, FairTeam AI can mask:
+
+- Email addresses
+- Phone numbers
+- Student IDs
+- Tokens embedded in URLs
+
+API keys are read from the current session or environment and are not written into reports, manifests, snapshots, or exported review packages.
+
+### Reproducible analysis snapshots
+
+Each analysis receives a deterministic fingerprint based on the active evidence and settings. Saved results include a versioned manifest with:
+
+- Workspace and reviewer information
+- Analysis ID
+- Project type and normalized weights
+- Member list
+- Evidence source label
+- AI model and privacy settings
+- Review Readiness result
+- Decision-support notice
+
+### One-click review package
+
+Users can download or save a ZIP package containing:
+
+```text
+reports/
+├── professor_report.md
+├── team_report.md
+├── ai_review_brief.md
+└── scoring_policy.md
+
+data/
+├── member_scores.csv
+├── quality_audit.csv
+└── meeting_insights.csv
+
+manifest.json
+```
+
+This makes it easier to archive a review, share it with an authorized reviewer, or attach it to an assessment record.
+
+### Multi-team comparison
+
+Instructors can analyze multiple team folders and compare:
+
+- Contribution inequality
+- Conflict risk
+- Number of high-risk members
+- Average confidence
+- Team size
+
+---
+
+## Typical user workflows
+
+### Instructor or mentor
+
+1. Open FairTeam AI.
+2. Use the included sample project or upload the team's evidence files.
+3. Select the project type and adjust category weights when necessary.
+4. Run the analysis.
+5. Check Review Readiness before interpreting contribution percentages.
+6. Review member-level evidence, quality flags, and meeting signals.
+7. Generate an AI Review Brief when an OpenAI key is available.
+8. Resolve submitted appeals.
+9. Download the complete review package for your records.
+
+### Team member
+
+1. Review the evidence shown for your work.
+2. Check whether offline contributions are missing.
+3. Submit an appeal with a file name, pull request, document section, or meeting record.
+4. Track the review status and provide additional evidence when requested.
+
+### Program or course operator
+
+1. Organize each team as a separate input folder.
+2. Run multi-team comparison.
+3. Identify teams that need an early intervention.
+4. Preserve review packages and snapshots for a consistent assessment process.
+
+---
+
+## Quick start
+
+### 1. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-선택 사항: OpenAI API 기반 회의록 구조화를 쓰려면 `openai` 패키지와 환경변수가 필요합니다. 없어도 fallback으로 정상 실행됩니다.
+### 2. Configure optional environment variables
+
+Copy the example file:
 
 ```bash
-pip install openai
-export OPENAI_API_KEY="YOUR_KEY"
-export OPENAI_MODEL="gpt-4o-mini"
+cp .env.example .env
 ```
 
-## 대시보드 실행
+Open `.env` and add your own values:
+
+```env
+OPENAI_API_KEY=
+OPENAI_MODEL=gpt-5.6
+OPENAI_TIMEOUT_SECONDS=45
+OPENAI_MAX_RETRIES=2
+FAIRTEAM_USE_LLM=false
+GITHUB_TOKEN=
+```
+
+The application works without an OpenAI key. Add a key only when you want OpenAI-powered meeting analysis and review briefs.
+
+Never commit the real `.env` file.
+
+### 3. Start the dashboard
 
 ```bash
 streamlit run app.py
 ```
 
-실행 후 사이드바의 **샘플 데이터로 데모 실행**을 켜면 바로 결과를 볼 수 있습니다.
+The dashboard opens in your browser. Select **Sample Data** to explore the complete workflow immediately.
 
-## CLI 데모 실행
+### 4. Run the CLI demo
 
 ```bash
 python run_demo.py
 ```
 
-출력 파일:
+The CLI generates a complete review package under `outputs/`.
 
-```text
-outputs/fairteam_member_scores.csv
-outputs/fairteam_quality_audit.csv
-outputs/fairteam_meeting_insights.csv
-outputs/professor_report.md
-outputs/team_report.md
-outputs/scoring_policy.md
+To enable OpenAI features in the CLI:
+
+```env
+FAIRTEAM_USE_LLM=true
+OPENAI_API_KEY=your_key_here
 ```
 
-## GitHub API로 github_log.csv 생성
+---
+
+## Input files
+
+A complete project bundle can contain the following files:
+
+```text
+meeting_notes.txt
+github_log.csv
+docs_revision.csv
+slides_revision.csv
+roles.csv
+self_evaluation.csv
+```
+
+CSV templates can be downloaded directly from the dashboard.
+
+### GitHub activity
+
+Required columns:
+
+```csv
+member,commits,additions,deletions,files_changed,issues_closed,prs_merged,reviews,bugfix_commits,test_commits
+A,28,3920,1110,46,9,12,8,7,6
+```
+
+Optional fields improve quality and anti-gaming checks:
+
+```csv
+commit_messages,unique_message_ratio,dominant_file_ratio,generated_files,timestamp
+"fix | fix | update",0.33,0.72,4,2026-05-06 22:10:00
+```
+
+### Document revisions
+
+```csv
+member,edits,words_added,comments_resolved,sections_owned,suggestions_accepted,references_added
+B,31,4820,18,5,14,8
+```
+
+### Presentation work
+
+```csv
+member,slides_edited,visuals_created,script_words,presenter_minutes
+B,16,7,980,7
+```
+
+### Responsibilities
+
+```csv
+member,assigned_tasks,completed_tasks,late_tasks,critical_tasks
+C,5,1,3,0
+```
+
+### Self-evaluation
+
+```csv
+member,self_claim_percent,claimed_main_work,peer_comment
+C,25,Research and report support,I contributed ideas offline.
+```
+
+---
+
+## Importing directly from GitHub
+
+Create `github_log.csv` from a public repository:
 
 ```bash
 python scripts/ingest_github.py \
@@ -77,7 +316,7 @@ python scripts/ingest_github.py \
   --out sample_data/github_log.csv
 ```
 
-비공개 저장소나 rate limit 회피가 필요하면 token을 추가합니다.
+For a private repository or higher rate limits:
 
 ```bash
 python scripts/ingest_github.py \
@@ -86,9 +325,11 @@ python scripts/ingest_github.py \
   --out sample_data/github_log.csv
 ```
 
-## 다팀 비교 폴더 구조
+A token can also be entered temporarily in the dashboard. Session input is not persisted by FairTeam AI.
 
-사이드바의 **팀별 입력 폴더 루트**에 아래 구조의 상위 폴더를 입력하면 교수자용 다팀 비교 탭에서 여러 팀을 비교합니다.
+---
+
+## Multi-team folder layout
 
 ```text
 class_teams/
@@ -108,73 +349,93 @@ class_teams/
     └── self_evaluation.csv
 ```
 
-## CSV 입력 형식
+Enter the parent directory in the dashboard's **Multi-team Comparison** setting.
 
-### github_log.csv
+---
 
-필수 컬럼:
+## Output files
 
-```csv
-member,commits,additions,deletions,files_changed,issues_closed,prs_merged,reviews,bugfix_commits,test_commits
-A,28,3920,1110,46,9,12,8,7,6
+Saving from the dashboard or running the CLI creates files such as:
+
+```text
+outputs/
+├── fairteam_member_scores.csv
+├── fairteam_quality_audit.csv
+├── fairteam_meeting_insights.csv
+├── professor_report.md
+├── team_report.md
+├── ai_review_brief.md
+├── scoring_policy.md
+├── analysis_manifest.json
+├── fairteam_review_package.zip
+└── snapshots/
 ```
 
-선택 컬럼이 있으면 조작 방어가 더 강해집니다.
+---
 
-```csv
-commit_messages,unique_message_ratio,dominant_file_ratio,generated_files,timestamp
-"fix | fix | update",0.33,0.72,4,2026-05-06 22:10:00
+## Trust, fairness, and responsible use
+
+FairTeam AI follows these principles:
+
+1. **Human review is mandatory.** The system does not produce a final grade or disciplinary decision.
+2. **Missing logs are not proof of missing work.** Offline contributions must be collected through the appeal process.
+3. **Original evidence takes priority.** Reviewers should inspect the actual commit, file, revision, or meeting record behind any important finding.
+4. **Quality matters more than raw volume.** Large counts are compressed or quality-adjusted when appropriate.
+5. **Workload overload is not misconduct.** Overload is treated as a team-management signal, not an automatic penalty.
+6. **AI is optional and fault-tolerant.** Deterministic analysis remains available when an API key is missing or an API request fails.
+7. **Secrets are not exported.** API keys are excluded from reports, manifests, snapshots, and ZIP packages.
+
+Before using the product in a real educational or workplace setting, define who can access raw evidence, how long records are retained, how appeals are handled, and who makes the final decision.
+
+---
+
+## Testing
+
+```bash
+pytest -q
 ```
 
-### docs_revision.csv
+The test suite covers scoring, meeting attribution, GitHub ingestion, review readiness, environment configuration, and review-package generation.
 
-```csv
-member,edits,words_added,comments_resolved,sections_owned,suggestions_accepted,references_added
-B,31,4820,18,5,14,8
+---
+
+## Project structure
+
+```text
+FairTeamAI/
+├── app.py
+├── run_demo.py
+├── requirements.txt
+├── .env.example
+├── fairteam_ai/
+│   ├── ai_review.py
+│   ├── analyzers.py
+│   ├── appeals.py
+│   ├── batch.py
+│   ├── config.py
+│   ├── github_ingest.py
+│   ├── interventions.py
+│   ├── loaders.py
+│   ├── meeting_ai.py
+│   ├── models.py
+│   ├── privacy.py
+│   ├── quality.py
+│   ├── readiness.py
+│   ├── reporting.py
+│   ├── scoring.py
+│   ├── scoring_policy.py
+│   ├── settings.py
+│   └── workspace.py
+├── sample_data/
+├── scripts/
+├── tests/
+└── outputs/
 ```
 
-### slides_revision.csv
+---
 
-```csv
-member,slides_edited,visuals_created,script_words,presenter_minutes
-B,16,7,980,7
-```
+## Current product boundary
 
-### roles.csv
+This repository is a strong local-first review application suitable for demonstrations, pilots, classrooms, bootcamps, and small-team assessment workflows.
 
-```csv
-member,assigned_tasks,completed_tasks,late_tasks,critical_tasks
-C,5,1,3,0
-```
-
-### self_evaluation.csv
-
-```csv
-member,self_claim_percent,claimed_main_work,peer_comment
-C,25,Research and report support,I contributed ideas offline.
-```
-
-## 산출 지표
-
-FairTeam AI는 팀원별로 다음 신호를 계산합니다.
-
-- 코드 기여도: 커밋 수, 변경 라인 수, 파일 수, 이슈 해결, PR 병합, 리뷰, 테스트/버그픽스 커밋
-- 문서 기여도: 편집 수, 추가 단어 수, 해결 댓글, 담당 섹션, 제안 반영, 참고문헌 추가
-- 발표 기여도: 수정 슬라이드 수, 시각자료, 대본 작성량, 발표 담당 시간
-- 회의 기여도: 참석, 발언, 액션아이템 배정 및 완료, 의사결정 언급, 회의록 구조화 신호
-- 역할 이행도: 배정 업무, 완료 업무, 지연 업무, 핵심 업무
-- 자기평가 불일치: 자기 주장 기여율과 로그 기반 추정치의 차이
-- 품질/조작 감사: 증거 출처, 반복 패턴, 대량 변경, 마감 직전 집중, 단일 출처 의존
-
-## 설계 원칙
-
-이 시스템은 팀원의 최종 점수를 자동으로 확정하지 않습니다. 자동 산출값은 다음 목적의 **근거 보조 자료**입니다.
-
-1. 교수자가 실제 기여 로그를 빠르게 검토
-2. 팀원이 누락된 오프라인 기여 증거를 추가 제출
-3. 팀 프로젝트 중간 단계에서 역할 불균형과 갈등을 조기에 완화
-4. 조작 의심 신호가 있을 때 처벌이 아니라 원자료 재검토 지점을 표시
-
-따라서 최종 평가는 반드시 교수자 또는 평가자가 원자료와 함께 검토해야 합니다.
-
-
+For a large institutional deployment, the next layer would typically include authenticated user accounts, organization-level permissions, encrypted database storage, centralized audit logs, retention policies, background job processing, and deployment-specific compliance controls.
