@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import os
+import hashlib
+import json
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -8,6 +9,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from fairteam_ai.ai_review import generate_ai_review_brief
 from fairteam_ai.appeals import AppealStore
 from fairteam_ai.batch import analyze_many_teams
 from fairteam_ai.config import DEFAULT_WEIGHTS
@@ -28,8 +30,16 @@ from fairteam_ai.loaders import (
     template_dataframe,
 )
 from fairteam_ai.privacy import redact_dataframe, redact_text
+from fairteam_ai.readiness import calculate_review_readiness
 from fairteam_ai.reporting import members_to_rows
 from fairteam_ai.scoring import compute_fairness_report
+from fairteam_ai.settings import get_openai_settings
+from fairteam_ai.workspace import (
+    SnapshotStore,
+    build_analysis_manifest,
+    build_review_package,
+    bundle_fingerprint,
+)
 
 st.set_page_config(page_title="FairTeam AI", page_icon="⚖️", layout="wide")
 
@@ -329,15 +339,25 @@ def save_outputs(
     meeting_insights_df: pd.DataFrame,
     professor_report_md: str,
     team_report_md: str,
-) -> None:
+    ai_review_brief_md: str,
+    manifest: Dict[str, object],
+    review_package: bytes,
+) -> Path:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     rows.to_csv(OUT_DIR / "fairteam_member_scores.csv", index=False)
     audit_df.to_csv(OUT_DIR / "fairteam_quality_audit.csv", index=False)
     meeting_insights_df.to_csv(OUT_DIR / "fairteam_meeting_insights.csv", index=False)
     (OUT_DIR / "professor_report.md").write_text(professor_report_md, encoding="utf-8")
     (OUT_DIR / "team_report.md").write_text(team_report_md, encoding="utf-8")
+    (OUT_DIR / "ai_review_brief.md").write_text(ai_review_brief_md, encoding="utf-8")
     (OUT_DIR / "scoring_policy.md").write_text(report.score_policy_md, encoding="utf-8")
+    (OUT_DIR / "analysis_manifest.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2, default=str),
+        encoding="utf-8",
+    )
+    (OUT_DIR / "fairteam_review_package.zip").write_bytes(review_package)
     save_bundle_to_directory(bundle, OUT_DIR / "last_dashboard_inputs")
+    return SnapshotStore(OUT_DIR / "snapshots").save(manifest)
 
 
 def main() -> None:
@@ -345,11 +365,19 @@ def main() -> None:
     hero()
 
     sample_bundle = load_project_bundle(SAMPLE_DIR)
+    env_openai = get_openai_settings()
 
     with st.sidebar:
         st.header("실행 설정")
+        workspace_name = st.text_input("워크스페이스 이름", value="FairTeam Review")
+        reviewer_name = st.text_input("검토자 이름", value="", placeholder="선택 입력")
         data_mode = st.radio("데이터 소스", options=["샘플 데이터", "업로드 데이터"], index=0)
-        redact_export = st.toggle("개인정보 자동 마스킹", value=True)
+        redact_export = st.toggle("리포트 개인정보 자동 마스킹", value=True)
+        redact_before_llm = st.toggle(
+            "OpenAI 전송 전 개인정보 마스킹",
+            value=True,
+            help="이메일, 전화번호, 학번, URL 토큰을 마스킹한 회의록만 OpenAI에 전송합니다.",
+        )
 
         st.markdown("---")
         st.subheader("OpenAI API")
@@ -357,26 +385,33 @@ def main() -> None:
             "OpenAI API Key",
             value="",
             type="password",
-            placeholder="sk-...",
-            help="회의록 구조화에만 사용합니다. 입력값은 파일로 저장하지 않습니다.",
+            placeholder=".env에 입력하면 자동 인식",
+            help="현재 세션에서만 사용하며 파일이나 분석 결과에 저장하지 않습니다.",
         )
-        env_key_exists = bool(os.getenv("OPENAI_API_KEY"))
-        default_llm = bool(api_key_input.strip() or env_key_exists)
+        openai_model = st.text_input("OpenAI model", value=env_openai.model)
         use_openai_llm = st.toggle(
-            "OpenAI로 회의록 구조화",
-            value=default_llm,
-            help="키가 없거나 openai 패키지가 없거나 호출에 실패하면 규칙 기반 fallback을 자동 사용합니다.",
+            "OpenAI 회의록 구조화 사용",
+            value=env_openai.configured,
+            help="호출 실패 또는 키 미설정 시 규칙 기반 분석으로 자동 전환합니다.",
+        )
+        resolved_openai = get_openai_settings(
+            api_key_override=api_key_input.strip() or None,
+            model_override=openai_model.strip() or None,
         )
         if api_key_input.strip():
-            st.success("입력한 API Key를 현재 세션에서 사용")
-        elif env_key_exists:
-            st.info("환경변수 OPENAI_API_KEY 감지")
+            st.success("세션 API Key 사용 중")
+        elif resolved_openai.configured:
+            st.info(f".env API Key 감지 · {resolved_openai.model}")
         else:
-            st.caption("키가 없으면 fallback 분석 사용")
+            st.caption("키가 없으면 모든 핵심 기능이 deterministic fallback으로 동작합니다.")
 
         st.markdown("---")
         st.subheader("가중치")
-        project_type = st.selectbox("프로젝트 유형", options=list(DEFAULT_WEIGHTS.keys()), index=list(DEFAULT_WEIGHTS.keys()).index("development"))
+        project_type = st.selectbox(
+            "프로젝트 유형",
+            options=list(DEFAULT_WEIGHTS.keys()),
+            index=list(DEFAULT_WEIGHTS.keys()).index("development"),
+        )
         base_weights = DEFAULT_WEIGHTS[project_type]
         code_w = st.slider("코드", 0.0, 1.0, float(base_weights["code"]), 0.01)
         doc_w = st.slider("보고서/문서", 0.0, 1.0, float(base_weights["document"]), 0.01)
@@ -412,14 +447,43 @@ def main() -> None:
         st.error("팀원을 찾지 못했습니다. 업로드 CSV의 member 컬럼 또는 회의록의 이름 표기를 확인하세요.")
         st.stop()
 
-    report = compute_fairness_report(
-        members=members,
-        project_type=project_type,
-        custom_weights=custom_weights,
-        use_llm_meeting_analysis=use_openai_llm,
-        openai_api_key=api_key_input.strip() or None,
-        **bundle,
+    llm_meeting_notes = (
+        redact_text(bundle["meeting_notes"]) if redact_before_llm else str(bundle["meeting_notes"])
     )
+    key_fingerprint = hashlib.sha256((resolved_openai.api_key or "").encode("utf-8")).hexdigest()[:8]
+    analysis_options = {
+        "project_type": project_type,
+        "weights": custom_weights,
+        "use_openai": use_openai_llm,
+        "openai_model": resolved_openai.model,
+        "openai_key_fingerprint": key_fingerprint,
+        "redact_before_llm": redact_before_llm,
+    }
+    analysis_fingerprint = bundle_fingerprint(bundle, analysis_options)
+    refresh_requested = st.button("분석 실행 / 새로고침", type="primary", use_container_width=True)
+    cached_analysis = st.session_state.get("fairteam_analysis")
+    if (
+        refresh_requested
+        or not cached_analysis
+        or cached_analysis.get("fingerprint") != analysis_fingerprint
+    ):
+        with st.spinner("근거를 교차 검증하고 분석 리포트를 생성하는 중입니다..."):
+            report = compute_fairness_report(
+                members=members,
+                project_type=project_type,
+                custom_weights=custom_weights,
+                use_llm_meeting_analysis=use_openai_llm,
+                openai_api_key=resolved_openai.api_key,
+                openai_model=resolved_openai.model,
+                llm_meeting_notes=llm_meeting_notes,
+                **bundle,
+            )
+        st.session_state["fairteam_analysis"] = {
+            "fingerprint": analysis_fingerprint,
+            "report": report,
+        }
+    else:
+        report = cached_analysis["report"]
 
     rows = pd.DataFrame(members_to_rows(report.members))
     rows_display = percent_columns(rows)
@@ -431,27 +495,76 @@ def main() -> None:
 
     meeting_insights_df = pd.DataFrame(report.meeting_insights)
     audit_df = pd.DataFrame(report.audit_rows)
-    engine_label = "fallback"
+    appeal_store = AppealStore(OUT_DIR / "appeals.jsonl")
+    appeals = appeal_store.list()
+    unresolved_appeals = sum(1 for appeal in appeals if appeal.status in {"submitted", "under_review"})
+    readiness = calculate_review_readiness(
+        report=report,
+        bundle_health=health_df.to_dict(orient="records"),
+        unresolved_appeals=unresolved_appeals,
+    )
+
+    brief_key = f"{analysis_fingerprint}:{readiness.score}:{unresolved_appeals}"
+    cached_brief = st.session_state.get("fairteam_ai_brief")
+    if cached_brief and cached_brief.get("key") == brief_key:
+        ai_review_brief = cached_brief["brief"]
+    else:
+        ai_review_brief = generate_ai_review_brief(
+            report=report,
+            readiness_status=readiness.status,
+            scores=rows,
+            audit=audit_df,
+            use_llm=False,
+        )
+    ai_review_brief_md = ai_review_brief.to_markdown()
+
+    manifest = build_analysis_manifest(
+        workspace_name=workspace_name,
+        reviewer_name=reviewer_name,
+        fingerprint=analysis_fingerprint,
+        project_type=project_type,
+        weights=report.weights,
+        members=members,
+        source_label=source_label,
+        llm_enabled=use_openai_llm and resolved_openai.configured,
+        llm_model=resolved_openai.model,
+        llm_redacted=redact_before_llm,
+        readiness=readiness.to_dict(),
+    )
+    review_package = build_review_package(
+        scores=rows,
+        audit=audit_df,
+        meeting_insights=meeting_insights_df,
+        professor_report_md=professor_report_md,
+        team_report_md=team_report_md,
+        scoring_policy_md=report.score_policy_md,
+        ai_review_brief_md=ai_review_brief_md,
+        manifest=manifest,
+    )
+
+    engine_label = "rule_fallback"
     if not meeting_insights_df.empty and "analysis_engine" in meeting_insights_df.columns:
         engines = sorted(set(str(x) for x in meeting_insights_df["analysis_engine"].dropna().tolist()))
-        engine_label = ", ".join(engines) if engines else "fallback"
-    elif use_openai_llm and (api_key_input.strip() or os.getenv("OPENAI_API_KEY")):
-        engine_label = "openai 시도 후 fallback/empty"
+        engine_label = ", ".join(engines) if engines else "rule_fallback"
+    elif use_openai_llm and resolved_openai.configured:
+        engine_label = "OpenAI attempted → fallback/empty"
 
     st.markdown("<div class='soft-card'>", unsafe_allow_html=True)
-    top1, top2, top3, top4 = st.columns(4)
+    top1, top2, top3, top4, top5 = st.columns(5)
     with top1:
-        status_card("현재 데이터", source_label, "화면 전체가 이 입력 기준으로 계산됩니다")
+        status_card("현재 데이터", source_label, "활성 입력 기준")
     with top2:
-        status_card("팀원 수", str(len(members)), ", ".join(members[:5]) + ("..." if len(members) > 5 else ""))
+        status_card("검토 준비도", f"{readiness.score * 100:.0f}%", readiness.status)
     with top3:
-        status_card("회의록 분석", engine_label, "OpenAI 실패/미설정 시 fallback")
+        status_card("팀원 수", str(len(members)), ", ".join(members[:4]) + ("..." if len(members) > 4 else ""))
     with top4:
-        status_card("출력 위치", "outputs/", "저장 버튼 클릭 시 현재 결과 저장")
+        status_card("회의록 분석", engine_label, resolved_openai.model if use_openai_llm else "deterministic")
+    with top5:
+        status_card("분석 ID", analysis_fingerprint, "재현 가능한 스냅샷")
     st.markdown("</div>", unsafe_allow_html=True)
 
-    if st.button("현재 분석 결과를 outputs 폴더에 저장", type="primary", use_container_width=True):
-        save_outputs(
+    if st.button("현재 분석 결과와 검토 패키지를 outputs 폴더에 저장", use_container_width=True):
+        snapshot_path = save_outputs(
             bundle=bundle,
             report=report,
             rows=rows,
@@ -459,11 +572,25 @@ def main() -> None:
             meeting_insights_df=meeting_insights_df,
             professor_report_md=professor_report_md,
             team_report_md=team_report_md,
+            ai_review_brief_md=ai_review_brief_md,
+            manifest=manifest,
+            review_package=review_package,
         )
-        st.success("현재 대시보드 입력과 분석 결과를 outputs/에 저장했습니다.")
+        st.success(f"저장 완료: outputs/ · 스냅샷 {snapshot_path.name}")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs(
-        ["대시보드", "근거 로그", "AI 회의록 구조화", "품질/조작 감사", "갈등/위험", "다팀 비교", "개입/이의제기", "교수자 리포트", "원자료"]
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs(
+        [
+            "대시보드",
+            "근거 로그",
+            "AI 회의록 구조화",
+            "AI 검토 브리프",
+            "품질/조작 감사",
+            "갈등/위험",
+            "다팀 비교",
+            "개입/이의제기",
+            "교수자 리포트",
+            "원자료",
+        ]
     )
 
     with tab1:
@@ -474,6 +601,16 @@ def main() -> None:
         m2.metric("최대/최소 기여 비율", f"{report.imbalance_ratio:.2f}x")
         m3.metric("갈등 위험", f"{report.conflict_risk_score * 100:.1f}%")
         m4.metric("평균 산출 신뢰도", f"{rows['confidence_score'].mean() * 100:.1f}%")
+
+        with st.expander("검토 준비도 상세", expanded=readiness.score < 0.78):
+            r1, r2, r3 = st.columns(3)
+            r1.metric("근거 소스 커버리지", f"{readiness.evidence_coverage * 100:.0f}%")
+            r2.metric("미해결 이의제기", str(readiness.unresolved_appeals))
+            r3.metric("핵심 감사 플래그", str(readiness.critical_flags))
+            if readiness.blockers:
+                st.warning("검토 전 보완: " + " / ".join(readiness.blockers))
+            if readiness.strengths:
+                st.success("현재 강점: " + " / ".join(readiness.strengths))
 
         chart_df = rows.sort_values("contribution_share", ascending=False)
         fig = px.bar(
@@ -529,6 +666,42 @@ def main() -> None:
         )
 
     with tab4:
+        st.subheader("AI 검토 브리프")
+        st.caption(
+            "점수 확정이 아니라, 검토 우선순위·확인 질문·다음 조치를 정리하는 보조 브리프입니다. "
+            "OpenAI를 사용하지 않아도 deterministic 브리프가 제공됩니다."
+        )
+        if st.button(
+            "OpenAI로 검토 브리프 다시 생성",
+            disabled=not resolved_openai.configured,
+            use_container_width=True,
+        ):
+            with st.spinner("OpenAI가 검토 브리프를 구조화하는 중입니다..."):
+                generated_brief = generate_ai_review_brief(
+                    report=report,
+                    readiness_status=readiness.status,
+                    scores=rows,
+                    audit=audit_df,
+                    use_llm=True,
+                    api_key=resolved_openai.api_key,
+                    model=resolved_openai.model,
+                )
+            st.session_state["fairteam_ai_brief"] = {"key": brief_key, "brief": generated_brief}
+            st.rerun()
+
+        b1, b2, b3 = st.columns(3)
+        b1.metric("검토 준비 상태", readiness.status)
+        b2.metric("준비도 점수", f"{readiness.score * 100:.0f}%")
+        b3.metric("브리프 엔진", ai_review_brief.analysis_engine)
+        st.markdown(ai_review_brief_md)
+        st.download_button(
+            "AI 검토 브리프 다운로드",
+            data=ai_review_brief_md.encode("utf-8"),
+            file_name="fairteam_ai_review_brief.md",
+            mime="text/markdown",
+        )
+
+    with tab5:
         st.subheader("품질/조작 감사")
         st.dataframe(audit_df, use_container_width=True)
         qfig = px.scatter(
@@ -545,7 +718,7 @@ def main() -> None:
             st.markdown(report.score_policy_md)
         st.info("이 탭은 자동 판정이 아니라 교수자가 원자료를 다시 볼 지점을 표시합니다. 커밋 쪼개기·대량 붙여넣기·반복 커밋 메시지·동일 파일 반복 수정·마감 직전 집중·단일 출처 의존 등을 검토 신호로 다룹니다.")
 
-    with tab5:
+    with tab6:
         st.subheader("갈등 위험 및 무임승차 위험")
         risk_rows = rows[rows["risk_tags"].astype(str).str.len() > 0]
         if risk_rows.empty:
@@ -559,7 +732,7 @@ def main() -> None:
         else:
             st.write("명시적 갈등 문장이 크게 감지되지 않았습니다.")
 
-    with tab6:
+    with tab7:
         st.subheader("교수자용 다팀 비교")
         current_row = pd.DataFrame(
             [
@@ -589,14 +762,13 @@ def main() -> None:
             st.plotly_chart(fig, use_container_width=True)
         st.caption("팀별 폴더는 meeting_notes.txt, github_log.csv, docs_revision.csv, slides_revision.csv, roles.csv, self_evaluation.csv를 포함해야 합니다.")
 
-    with tab7:
+    with tab8:
         st.subheader("개입 권장안")
         for i, action in enumerate(report.intervention_plan, start=1):
             st.write(f"{i}. {action}")
 
         st.markdown("---")
         st.subheader("팀원 이의제기 접수")
-        appeal_store = AppealStore(OUT_DIR / "appeals.jsonl")
         with st.form("appeal_form"):
             c1, c2 = st.columns(2)
             with c1:
@@ -607,25 +779,60 @@ def main() -> None:
             appeal_claim = st.text_area("이의제기 내용", placeholder="누락된 오프라인 기여나 잘못 해석된 로그를 구체적으로 적으세요.")
             submitted = st.form_submit_button("이의제기 제출")
             if submitted:
-                created = appeal_store.submit(appeal_member, appeal_category, appeal_claim, appeal_ref)
-                st.success(f"이의제기가 접수되었습니다: {created.appeal_id}")
+                if not appeal_claim.strip():
+                    st.error("이의제기 내용을 입력하세요.")
+                else:
+                    created = appeal_store.submit(appeal_member, appeal_category, appeal_claim, appeal_ref)
+                    st.success(f"이의제기가 접수되었습니다: {created.appeal_id}")
+                    st.rerun()
 
         appeals = appeal_store.list()
         if appeals:
             st.markdown("### 접수된 이의제기")
             st.dataframe(pd.DataFrame([a.__dict__ for a in appeals]), use_container_width=True)
+            with st.expander("검토자 상태 업데이트", expanded=False):
+                selected_appeal = st.selectbox(
+                    "이의제기 선택",
+                    options=[a.appeal_id for a in appeals],
+                    format_func=lambda appeal_id: next(
+                        f"{a.appeal_id} · {a.member} · {a.status}" for a in appeals if a.appeal_id == appeal_id
+                    ),
+                )
+                selected_status = st.selectbox(
+                    "검토 상태",
+                    options=["submitted", "under_review", "accepted", "rejected"],
+                )
+                reviewer_note = st.text_area("검토 메모", placeholder="판단 근거와 추가 확인 사항을 기록하세요.")
+                if st.button("이의제기 상태 저장", use_container_width=True):
+                    updated = appeal_store.update(selected_appeal, selected_status, reviewer_note)
+                    if updated:
+                        st.success(f"{updated.appeal_id} 상태를 {updated.status}(으)로 변경했습니다.")
+                        st.rerun()
         else:
             st.caption("아직 접수된 이의제기가 없습니다.")
 
-    with tab8:
+    with tab9:
         st.subheader("교수자용 공정평가 리포트")
         st.markdown(professor_report_md)
         st.download_button("교수자 리포트 Markdown 다운로드", data=professor_report_md.encode("utf-8"), file_name="fairteam_professor_report.md", mime="text/markdown")
         st.download_button("팀원별 점수 CSV 다운로드", data=rows.to_csv(index=False).encode("utf-8"), file_name="fairteam_member_scores.csv", mime="text/csv")
         st.download_button("조작/품질 감사 CSV 다운로드", data=audit_df.to_csv(index=False).encode("utf-8"), file_name="fairteam_quality_audit.csv", mime="text/csv")
         st.download_button("회의록 구조화 CSV 다운로드", data=meeting_insights_df.to_csv(index=False).encode("utf-8"), file_name="fairteam_meeting_insights.csv", mime="text/csv")
+        st.download_button(
+            "전체 검토 패키지 ZIP 다운로드",
+            data=review_package,
+            file_name=f"fairteam_review_{analysis_fingerprint}.zip",
+            mime="application/zip",
+            use_container_width=True,
+        )
+        st.download_button(
+            "분석 manifest JSON 다운로드",
+            data=json.dumps(manifest, ensure_ascii=False, indent=2, default=str).encode("utf-8"),
+            file_name="fairteam_analysis_manifest.json",
+            mime="application/json",
+        )
 
-    with tab9:
+    with tab10:
         st.subheader("입력 원자료 미리보기")
         st.markdown("#### 입력 상태")
         st.dataframe(health_df, use_container_width=True)
