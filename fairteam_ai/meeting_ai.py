@@ -18,13 +18,14 @@ deadline unless the sentence also contains explicit failure/late wording.
 review-needed substitution signal for C.
 """
 
-import json
-import os
 import re
 from dataclasses import asdict, dataclass
-from typing import Iterable, List, Sequence
+from typing import Iterable, List, Literal, Sequence
 
 import pandas as pd
+from pydantic import BaseModel, Field
+
+from .settings import get_openai_settings
 
 
 @dataclass
@@ -408,78 +409,100 @@ def _rule_based_extract(meeting_notes: str, members: Sequence[str]) -> List[Meet
     return list(unique.values())
 
 
-def _coerce_openai_records(payload: object) -> list[dict]:
-    if isinstance(payload, list):
-        return [x for x in payload if isinstance(x, dict)]
-    if isinstance(payload, dict):
-        for key in ["insights", "items", "records", "data"]:
-            value = payload.get(key)
-            if isinstance(value, list):
-                return [x for x in value if isinstance(x, dict)]
-    return []
+class _OpenAIMeetingInsight(BaseModel):
+    member: str
+    evidence_type: Literal[
+        "completed_work",
+        "missed_deadline",
+        "no_response",
+        "conflict",
+        "assigned_action_item",
+        "review_activity",
+        "self_claim_needs_evidence",
+        "task_substitution",
+        "task_recovery",
+        "workload_overload",
+        "merged_work",
+        "shared_evidence",
+        "decision_leadership",
+        "other",
+    ]
+    polarity: Literal["positive", "negative", "neutral"]
+    severity: float = Field(ge=0.0, le=1.0)
+    confidence: float = Field(ge=0.0, le=1.0)
+    source_sentence: str
+    suggested_review_action: str
 
 
-def _try_openai_extract(meeting_notes: str, members: Sequence[str], *, api_key: str | None = None) -> List[MeetingInsight] | None:
-    resolved_key = (api_key or os.getenv("OPENAI_API_KEY") or "").strip()
-    if not resolved_key:
+class _OpenAIMeetingPayload(BaseModel):
+    insights: list[_OpenAIMeetingInsight] = Field(default_factory=list)
+
+
+def _try_openai_extract(
+    meeting_notes: str,
+    members: Sequence[str],
+    *,
+    api_key: str | None = None,
+    model: str | None = None,
+) -> List[MeetingInsight] | None:
+    settings = get_openai_settings(api_key_override=api_key, model_override=model)
+    if not settings.configured:
         return None
     try:
         from openai import OpenAI  # type: ignore
     except Exception:
         return None
 
-    model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-    schema_hint = {
-        "member": "exact member name from provided members",
-        "evidence_type": "completed_work | missed_deadline | no_response | conflict | assigned_action_item | review_activity | self_claim_needs_evidence | task_substitution | task_recovery | workload_overload | other",
-        "polarity": "positive | negative | neutral",
-        "severity": "0.0-1.0",
-        "confidence": "0.0-1.0",
-        "source_sentence": "short source sentence copied from notes",
-        "suggested_review_action": "one sentence for professor review",
-    }
-    prompt = (
-        "You are an audit assistant for university team projects. Extract auditable contribution and fairness signals "
-        "from meeting notes. Do not decide grades. Return only a JSON object with an 'insights' array. "
-        "Every member value must exactly match one of the provided members. Attribute negative signals only to the actual subject/target; "
-        "attendance lists are not negative evidence, and a deadline date alone is not a missed deadline.\n"
-        f"Members: {list(members)}\n"
-        f"Schema per item: {json.dumps(schema_hint, ensure_ascii=False)}\n"
+    system_prompt = (
+        "You are a neutral evidence-structuring assistant for team projects. "
+        "Extract auditable contribution and fairness signals from meeting notes. "
+        "Do not decide grades or accuse anyone of misconduct. Attribute each signal only to its actual actor or target. "
+        "Attendance lists are not negative evidence, a deadline date alone is not a missed deadline, and workload overload "
+        "must remain a neutral review signal rather than a penalty."
+    )
+    user_prompt = (
+        f"Allowed member names: {list(members)}\n"
+        "Every member field must exactly match one allowed name. Copy a short supporting sentence from the notes. "
+        "Return no signal when the evidence is ambiguous.\n\n"
         f"Meeting notes:\n{meeting_notes}"
     )
     try:
-        client = OpenAI(api_key=resolved_key)
-        response = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            response_format={"type": "json_object"},
+        client = OpenAI(
+            api_key=settings.api_key,
+            timeout=settings.timeout_seconds,
+            max_retries=settings.max_retries,
         )
-        text = response.choices[0].message.content or "{}"
-        loaded = json.loads(text)
-        records = _coerce_openai_records(loaded)
-        insights: List[MeetingInsight] = []
+        response = client.responses.parse(
+            model=settings.model,
+            input=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            text_format=_OpenAIMeetingPayload,
+        )
+        parsed = response.output_parsed
+        if parsed is None:
+            return None
         member_set = set(members)
-        for rec in records:
-            member = str(rec.get("member", "")).strip()
-            if member not in member_set:
+        insights: List[MeetingInsight] = []
+        for rec in parsed.insights:
+            if rec.member not in member_set:
                 continue
             insights.append(
                 MeetingInsight(
-                    member=member,
-                    evidence_type=str(rec.get("evidence_type", "other")),
-                    polarity=str(rec.get("polarity", "neutral")),
-                    severity=float(rec.get("severity", 0.3)),
-                    confidence=float(rec.get("confidence", 0.5)),
-                    source_sentence=str(rec.get("source_sentence", ""))[:500],
-                    suggested_review_action=str(rec.get("suggested_review_action", "원자료 재검토"))[:300],
-                    analysis_engine="openai",
+                    member=rec.member,
+                    evidence_type=rec.evidence_type,
+                    polarity=rec.polarity,
+                    severity=float(rec.severity),
+                    confidence=float(rec.confidence),
+                    source_sentence=rec.source_sentence[:500],
+                    suggested_review_action=rec.suggested_review_action[:300],
+                    analysis_engine="openai_responses",
                 )
             )
         return insights or None
     except Exception:
         return None
-
 
 def extract_meeting_insights(
     meeting_notes: str,
@@ -487,6 +510,8 @@ def extract_meeting_insights(
     *,
     use_llm: bool = False,
     openai_api_key: str | None = None,
+    openai_model: str | None = None,
+    llm_input_text: str | None = None,
 ) -> pd.DataFrame:
     """Return structured meeting evidence as a DataFrame.
 
@@ -494,7 +519,12 @@ def extract_meeting_insights(
     reports, and dashboard to treat the result as a first-class evidence source.
     """
     members = [str(m).strip() for m in members if str(m).strip()]
-    insights = _try_openai_extract(meeting_notes, members, api_key=openai_api_key) if use_llm else None
+    llm_notes = meeting_notes if llm_input_text is None else llm_input_text
+    insights = (
+        _try_openai_extract(llm_notes, members, api_key=openai_api_key, model=openai_model)
+        if use_llm
+        else None
+    )
     if insights is None:
         insights = _rule_based_extract(meeting_notes, members)
     if not insights:
